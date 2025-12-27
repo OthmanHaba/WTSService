@@ -28,6 +28,7 @@ services:
         condition: service_healthy
     networks:
       - wuzapi-network
+      - dokploy-network
     restart: on-failure
 
   db:
@@ -73,6 +74,8 @@ services:
 networks:
   wuzapi-network:
     driver: bridge
+  dokploy-network:
+    external: true
 
 volumes:
   db_data:
