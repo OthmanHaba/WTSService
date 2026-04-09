@@ -1837,7 +1837,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.PairError:
 		postmap["type"] = "PairError"
 		dowebhook = 1
-		log.Error().Msg("Pair error")
+		log.Error().Err(evt.Error).Str("id", evt.ID.String()).Str("lid", evt.LID.String()).Str("platform", evt.Platform).Msg("Pair error")
 	case *events.PrivacySettings:
 		postmap["type"] = "PrivacySettings"
 		dowebhook = 1
