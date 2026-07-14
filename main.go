@@ -69,10 +69,12 @@ var (
 	webhookRetryCount        = flag.Int("retrycount", 5, "Number of times to retry failed webhooks")
 	webhookRetryDelaySeconds = flag.Int("retrydelay", 30, "Delay in seconds between webhook retries")
 	webhookErrorQueueName    = flag.String("errorqueue", "webhook_errors", "RabbitMQ queue name for failed webhooks")
+	globalWebhookUseProxy    = flag.Bool("webhookuseproxy", true, "Route webhook deliveries through the per-user proxy when configured")
 
 	container        *sqlstore.Container
 	clientManager    = NewClientManager()
 	killchannel      = make(map[string](chan bool))
+	killchannelMu    sync.Mutex
 	userinfocache    = cache.New(5*time.Minute, 10*time.Minute)
 	lastMessageCache = cache.New(24*time.Hour, 24*time.Hour)
 	globalHTTPClient = newSafeHTTPClient()
@@ -81,6 +83,54 @@ var (
 var privateIPBlocks []*net.IPNet
 
 const version = "1.0.6"
+
+// killchannel maps a userID to its session goroutine's kill channel. It is
+// accessed from HTTP request goroutines (Connect/Disconnect/logout/delete) and
+// from the per-session startClient goroutine, so every map operation must be
+// serialized through killchannelMu. The helpers below lock only around the map
+// access itself — never while sending on or receiving from a channel — so a
+// slow or absent receiver can never block another session.
+func setKillChannel(userID string, ch chan bool) {
+	killchannelMu.Lock()
+	killchannel[userID] = ch
+	killchannelMu.Unlock()
+}
+
+func getKillChannel(userID string) (chan bool, bool) {
+	killchannelMu.Lock()
+	ch, ok := killchannel[userID]
+	killchannelMu.Unlock()
+	return ch, ok
+}
+
+// deleteKillChannel removes userID's entry, but only if it still maps to ch.
+// A session goroutine passes the channel it captured at startup; if a newer
+// session has replaced the entry in the meantime (a reconnect for the same
+// user), the map holds a different channel and this is a no-op. That stops a
+// slow-cleanup goroutine from an old session deleting the live session's kill
+// channel and leaving the new session unkillable.
+func deleteKillChannel(userID string, ch chan bool) {
+	killchannelMu.Lock()
+	if current, ok := killchannel[userID]; ok && current == ch {
+		delete(killchannel, userID)
+	}
+	killchannelMu.Unlock()
+}
+
+// signalKill delivers a non-blocking kill signal to userID's session goroutine,
+// if one is registered. The channel is buffered (cap 1) so the send never
+// blocks; the default guards a full buffer or a missing entry.
+func signalKill(userID string) {
+	ch, ok := getKillChannel(userID)
+	if !ok {
+		log.Debug().Str("userID", userID).Msg("signalKill: no kill channel registered (already cleaned up?)")
+		return
+	}
+	select {
+	case ch <- true:
+	default:
+	}
+}
 
 func newSafeHTTPClient() *http.Client {
 	return &http.Client{
@@ -213,6 +263,13 @@ func main() {
 	if v := os.Getenv("WEBHOOK_ERROR_QUEUE_NAME"); v != "" {
 		*webhookErrorQueueName = v
 	}
+	if v := os.Getenv("WUZAPI_WEBHOOK_USE_PROXY"); v != "" {
+		*globalWebhookUseProxy = strings.ToLower(v) == "true" || v == "1"
+	}
+
+	log.Info().
+		Bool("use_proxy", *globalWebhookUseProxy).
+		Msg("Webhook Proxy Configured")
 
 	log.Info().
 		Bool("enabled", *webhookRetryEnabled).
@@ -401,7 +458,7 @@ func main() {
 		)
 		container, err = sqlstore.New(context.Background(), "postgres", storeConnStr, dbLog)
 	} else {
-		storeConnStr = "file:" + filepath.ToSlash(filepath.Join(config.Path, "main.db")) + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_timeout=10000"
+		storeConnStr = "file:" + filepath.ToSlash(filepath.Join(config.Path, "main.db")) + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)"
 		container, err = sqlstore.New(context.Background(), "sqlite", storeConnStr, dbLog)
 	}
 
