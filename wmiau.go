@@ -32,6 +32,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"golang.org/x/net/proxy"
+	"sync"
 )
 
 // db field declaration as *sqlx.DB
@@ -61,6 +62,82 @@ func safeGo(name string, fn func()) {
 		}()
 		fn()
 	}()
+}
+
+// PendingPasskeyState holds the state of an in-progress passkey pairing.
+type PendingPasskeyState struct {
+	Request   *events.PairPasskeyRequest
+	Client    *whatsmeow.Client
+	CreatedAt time.Time
+}
+
+// passkeyStateTTL is how long a pending passkey request lives before being
+// automatically cleaned up. WhatsApp challenges typically expire after
+// ~10 minutes; we keep a generous margin.
+const passkeyStateTTL = 15 * time.Minute
+
+var (
+	pendingPasskeyMu       sync.Mutex
+	pendingPasskeyRequests = make(map[string]*PendingPasskeyState) // keyed by userID
+)
+
+// startPasskeyCleanup runs a background goroutine that periodically removes
+// stale pending passkey states. Call this once during server initialization.
+func startPasskeyCleanup() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			pendingPasskeyMu.Lock()
+			now := time.Now()
+			for userID, state := range pendingPasskeyRequests {
+				if now.Sub(state.CreatedAt) > passkeyStateTTL {
+					delete(pendingPasskeyRequests, userID)
+					log.Info().Str("userID", userID).Msg("Passkey state expired and cleaned up")
+				}
+			}
+			pendingPasskeyMu.Unlock()
+		}
+	}()
+}
+
+func storePendingPasskey(userID string, state *PendingPasskeyState) {
+	state.CreatedAt = time.Now()
+	pendingPasskeyMu.Lock()
+	pendingPasskeyRequests[userID] = state
+	pendingPasskeyMu.Unlock()
+}
+
+func getAndConsumePendingPasskey(userID string) *PendingPasskeyState {
+	pendingPasskeyMu.Lock()
+	state, ok := pendingPasskeyRequests[userID]
+	if ok {
+		delete(pendingPasskeyRequests, userID)
+	}
+	pendingPasskeyMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return state
+}
+
+func deletePendingPasskey(userID string) {
+	pendingPasskeyMu.Lock()
+	delete(pendingPasskeyRequests, userID)
+	pendingPasskeyMu.Unlock()
+}
+
+// peekPendingPasskey checks if there is a pending passkey request for this user
+// WITHOUT consuming it. Used by /session/qr, /session/passkey-status, and
+// /session/passkey-confirm.
+func peekPendingPasskey(userID string) *PendingPasskeyState {
+	pendingPasskeyMu.Lock()
+	state, ok := pendingPasskeyRequests[userID]
+	pendingPasskeyMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return state
 }
 
 // ensureS3ClientForUser loads S3 config from DB and initializes client if not already present (lazy init for reconnect-after-restart)
@@ -106,7 +183,15 @@ func sendToUserWebHookWithHmac(webhookurl string, path string, jsonData []byte, 
 		"instanceName": instance_name,
 	}
 
-	log.Debug().Interface("webhookData", data).Msg("Data being sent to webhook")
+	if len(jsonData) > 8192 {
+		log.Debug().
+			Str("userID", userID).
+			Str("instanceName", instance_name).
+			Int("jsonDataBytes", len(jsonData)).
+			Msg("Data being sent to webhook")
+	} else {
+		log.Debug().Interface("webhookData", data).Msg("Data being sent to webhook")
+	}
 
 	if webhookurl != "" {
 		log.Info().Str("url", webhookurl).Msg("Calling user webhook")
@@ -321,6 +406,9 @@ func (s *server) connectOnStartup() {
 }
 
 func parseJID(arg string) (types.JID, bool) {
+	if arg == "" {
+		return types.JID{}, false
+	}
 	if arg[0] == '+' {
 		arg = arg[1:]
 	}
@@ -337,6 +425,127 @@ func parseJID(arg string) (types.JID, bool) {
 		}
 		return recipient, true
 	}
+}
+
+// jidUserKey returns the phone/account part shared by users.jid and
+// whatsmeow_device.jid even when formats differ (380...:8@ vs 380...@).
+func jidUserKey(jid string) string {
+	if jid == "" {
+		return ""
+	}
+	userPart := strings.SplitN(jid, "@", 2)[0]
+	return strings.SplitN(userPart, ":", 2)[0]
+}
+
+// jidLookupCandidates builds JID variants to try with sqlstore.GetDevice before
+// falling back to account-key matching across all stored devices.
+func jidLookupCandidates(textjid string) []types.JID {
+	jid, ok := parseJID(textjid)
+	if !ok {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	var candidates []types.JID
+	add := func(candidate types.JID) {
+		if candidate.IsEmpty() {
+			return
+		}
+		key := candidate.String()
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+
+	add(jid)
+	add(jid.ToNonAD())
+
+	userOnly, _, _ := strings.Cut(jid.User, ":")
+	if userOnly != "" {
+		add(types.NewJID(userOnly, jid.Server))
+		if jid.Server == types.DefaultUserServer || jid.Server == types.HiddenUserServer {
+			add(types.NewJID(userOnly, types.DefaultUserServer))
+		}
+	}
+
+	return candidates
+}
+
+func canonicalStoreJID(deviceStore *store.Device) string {
+	if deviceStore == nil || deviceStore.ID == nil {
+		return ""
+	}
+	return deviceStore.ID.ToNonAD().String()
+}
+
+// resolveDeviceStore loads an existing WhatsApp session from sqlstore. When
+// users.jid does not exactly match whatsmeow_device.jid (common after LID/AD
+// format changes), it falls back to matching by account key so reconnect does
+// not create a fresh device and force QR scan.
+func (s *server) resolveDeviceStore(ctx context.Context, textjid string) (*store.Device, string) {
+	if textjid != "" {
+		for _, candidate := range jidLookupCandidates(textjid) {
+			deviceStore, err := container.GetDevice(ctx, candidate)
+			if err != nil {
+				log.Error().Err(err).Str("jid", candidate.String()).Msg("Failed to get device")
+				continue
+			}
+			if resolved := canonicalStoreJID(deviceStore); resolved != "" {
+				if candidate.String() != textjid {
+					log.Info().
+						Str("user_jid", textjid).
+						Str("store_jid", deviceStore.ID.String()).
+						Str("resolved_jid", resolved).
+						Msg("Resolved device by JID variant")
+				}
+				return deviceStore, resolved
+			}
+		}
+
+		key := jidUserKey(textjid)
+		if key != "" {
+			allDevices, err := container.GetAllDevices(ctx)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to list devices from store")
+			} else {
+				for _, deviceStore := range allDevices {
+					if resolved := canonicalStoreJID(deviceStore); resolved != "" && jidUserKey(resolved) == key {
+						log.Info().
+							Str("user_jid", textjid).
+							Str("store_jid", deviceStore.ID.String()).
+							Str("resolved_jid", resolved).
+							Msg("Resolved device by account key")
+						return deviceStore, resolved
+					}
+				}
+			}
+		}
+
+		log.Warn().Str("jid", textjid).Msg("No store found for jid. Creating new device")
+	} else {
+		log.Warn().Msg("No jid found. Creating new device")
+	}
+
+	return container.NewDevice(), ""
+}
+
+func (s *server) syncUserJID(userID, token, oldJID, newJID string) {
+	if newJID == "" || newJID == oldJID {
+		return
+	}
+	if _, err := s.db.Exec(`UPDATE users SET jid=$1 WHERE id=$2`, newJID, userID); err != nil {
+		log.Warn().Err(err).Str("user_id", userID).Msg("Failed to sync jid from device store")
+		return
+	}
+	if token != "" {
+		if myuserinfo, found := userinfocache.Get(token); found {
+			v := updateUserInfo(myuserinfo, "Jid", newJID)
+			userinfocache.Set(token, v, cache.NoExpiration)
+		}
+	}
+	log.Info().Str("user_id", userID).Str("old_jid", oldJID).Str("resolved_jid", newJID).Msg("Synced user jid from whatsmeow store")
 }
 
 // getPlatformTypeEnum converts a platform type string to the corresponding DeviceProps enum
@@ -404,26 +613,10 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 	const maxConnectionRetries = 3
 	const connectionRetryBaseWait = 5 * time.Second
 
-	var deviceStore *store.Device
+	deviceStore, resolvedJID := s.resolveDeviceStore(context.Background(), textjid)
+	s.syncUserJID(userID, token, textjid, resolvedJID)
+
 	var err error
-
-	// First handle the device store initialization
-	if textjid != "" {
-		jid, _ := parseJID(textjid)
-		deviceStore, err = container.GetDevice(context.Background(), jid)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to get device")
-			deviceStore = container.NewDevice()
-		}
-	} else {
-		log.Warn().Msg("No jid found. Creating new device")
-		deviceStore = container.NewDevice()
-	}
-
-	if deviceStore == nil {
-		log.Warn().Msg("No store found. Creating new one")
-		deviceStore = container.NewDevice()
-	}
 
 	clientLog := waLog.Stdout("Client", *waDebug, *colorOutput)
 
@@ -598,6 +791,51 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 							userinfocache.Set(token, v, cache.NoExpiration)
 						}
 					}
+				} else if evt.Event == "passkey-request" {
+					if evt.PasskeyRequest != nil {
+						storePendingPasskey(userID, &PendingPasskeyState{
+							Request: evt.PasskeyRequest,
+							Client:  client,
+						})
+						postmap := make(map[string]interface{})
+						postmap["event"] = "passkey-request"
+						postmap["type"] = "PasskeyRequest"
+						postmap["publicKey"] = evt.PasskeyRequest.PublicKey
+						sendEventWithWebHook(&mycli, postmap, "")
+						log.Info().Msg("Passkey request received, sent to frontend")
+					}
+				} else if evt.Event == "passkey-confirmation" {
+					if evt.PasskeyConfirmation != nil {
+						if evt.PasskeyConfirmation.SkipHandoffUX {
+							log.Info().Msg("Passkey confirmation: SkipHandoffUX=true, auto-confirming")
+							go func() {
+								ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+								defer cancel()
+								if err := client.SendPasskeyConfirmation(ctx); err != nil {
+									log.Error().Err(err).Msg("Failed to auto-confirm passkey")
+								} else {
+									log.Info().Msg("Auto-confirmed passkey successfully")
+								}
+							}()
+						} else {
+							postmap := make(map[string]interface{})
+							postmap["event"] = "passkey-confirmation"
+							postmap["type"] = "PasskeyConfirmation"
+							postmap["code"] = evt.PasskeyConfirmation.Code
+							postmap["skipHandoffUX"] = evt.PasskeyConfirmation.SkipHandoffUX
+							sendEventWithWebHook(&mycli, postmap, "")
+							log.Info().Str("code", evt.PasskeyConfirmation.Code).Msg("Passkey confirmation code sent to frontend")
+						}
+					}
+				} else if evt.Event == "error" {
+					log.Error().Str("event", evt.Event).Interface("error", evt.Error).Msg("QR channel error")
+					postmap := make(map[string]interface{})
+					postmap["event"] = "error"
+					postmap["type"] = "PairError"
+					if evt.Error != nil {
+						postmap["error"] = evt.Error.Error()
+					}
+					sendEventWithWebHook(&mycli, postmap, "")
 				} else {
 					log.Info().Str("event", evt.Event).Msg("Login event")
 				}
@@ -730,11 +968,24 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			log.Error().Err(err).Msg(sqlStmt)
 			return
 		}
+		if mycli.WAClient.Store != nil && mycli.WAClient.Store.ID != nil {
+			connectedJID := mycli.WAClient.Store.ID.ToNonAD().String()
+			query := mycli.db.Rebind(`UPDATE users SET jid=? WHERE id=?`)
+			if _, err := mycli.db.Exec(query, connectedJID, mycli.userID); err != nil {
+				log.Warn().Err(err).Str("user_id", mycli.userID).Msg("Failed to persist JID on connect")
+			} else if myuserinfo, found := userinfocache.Get(mycli.token); found {
+				v := updateUserInfo(myuserinfo, "Jid", connectedJID)
+				userinfocache.Set(mycli.token, v, cache.NoExpiration)
+			}
+		}
 	case *events.PairSuccess:
 		log.Info().Str("userid", mycli.userID).Str("token", mycli.token).Str("ID", evt.ID.String()).Str("BusinessName", evt.BusinessName).Str("Platform", evt.Platform).Msg("QR Pair Success")
-		jid := evt.ID
-		sqlStmt := `UPDATE users SET jid=$1 WHERE id=$2`
-		_, err := mycli.db.Exec(sqlStmt, jid, mycli.userID)
+		jidStr := evt.ID.String()
+		if mycli.WAClient.Store != nil && mycli.WAClient.Store.ID != nil {
+			jidStr = mycli.WAClient.Store.ID.ToNonAD().String()
+		}
+		sqlStmt := mycli.db.Rebind(`UPDATE users SET jid=? WHERE id=?`)
+		_, err := mycli.db.Exec(sqlStmt, jidStr, mycli.userID)
 		if err != nil {
 			log.Error().Err(err).Msg(sqlStmt)
 			return
@@ -749,9 +1000,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		} else {
 			txtid = myuserinfo.(Values).Get("Id")
 			token := myuserinfo.(Values).Get("Token")
-			v := updateUserInfo(myuserinfo, "Jid", fmt.Sprintf("%s", jid))
+			v := updateUserInfo(myuserinfo, "Jid", jidStr)
 			userinfocache.Set(token, v, cache.NoExpiration)
-			log.Info().Str("jid", jid.String()).Str("userid", txtid).Str("token", token).Msg("User information set")
+			log.Info().Str("jid", jidStr).Str("userid", txtid).Str("token", token).Msg("User information set")
 		}
 
 		// Check if automatic history sync is enabled and trigger it after QR code is scanned
@@ -1580,6 +1831,27 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postmap["type"] = "FBMessage"
 		dowebhook = 1
 		log.Info().Str("info", evt.Info.SourceString()).Msg("Facebook message received")
+	case *events.PairPasskeyRequest:
+		storePendingPasskey(mycli.userID, &PendingPasskeyState{
+			Request: evt,
+			Client:  mycli.WAClient,
+		})
+		postmap["type"] = "PasskeyRequest"
+		postmap["publicKey"] = evt.PublicKey
+		dowebhook = 1
+		log.Info().Msg("Passkey request received (event handler)")
+	case *events.PairPasskeyConfirmation:
+		postmap["type"] = "PasskeyConfirmation"
+		postmap["code"] = evt.Code
+		postmap["skipHandoffUX"] = evt.SkipHandoffUX
+		dowebhook = 1
+		log.Info().Str("code", evt.Code).Bool("skipHandoffUX", evt.SkipHandoffUX).Msg("Passkey confirmation received")
+	case *events.PairPasskeyError:
+		postmap["type"] = "PairPasskeyError"
+		postmap["error"] = evt.Error.Error()
+		postmap["continuation"] = evt.Continuation
+		dowebhook = 1
+		log.Warn().Err(evt.Error).Bool("continuation", evt.Continuation).Msg("Passkey pairing error")
 	default:
 		log.Warn().Str("event", fmt.Sprintf("%+v", evt)).Msg("Unhandled event")
 	}
