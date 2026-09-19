@@ -45,9 +45,12 @@ services:
       - wuzapi-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-wuzapi}"]
-      interval: 5s
+      # 5s meant 12 process spawns a minute forever; the probe only gates
+      # startup ordering, so it does not need that resolution.
+      interval: 30s
       timeout: 5s
       retries: 5
+      start_period: 30s
     restart: always
 
   rabbitmq:
@@ -65,10 +68,17 @@ services:
     networks:
       - wuzapi-network
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
+      # rabbitmq-diagnostics boots a whole Erlang VM per probe. On a small host
+      # that costs more CPU than the broker itself, and once the box is loaded
+      # the boot outruns the timeout, so the check fails forever while still
+      # burning a VM start every interval. A TCP probe on the AMQP port is
+      # enough to gate depends_on. Note nc/curl are absent from this image;
+      # bash and timeout are present.
+      test: ["CMD-SHELL", "timeout 5 bash -c '</dev/tcp/localhost/5672'"]
+      interval: 60s
+      timeout: 10s
       retries: 5
+      start_period: 120s
     restart: always
 
 networks:
