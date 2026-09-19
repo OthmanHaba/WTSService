@@ -1430,23 +1430,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if evt.Data != nil && evt.Data.Conversations != nil {
 			go func() {
 
-				// HistorySync redelivers the conversation backlog on every link and
-				// reconnect, so these batches are unbounded. Apply the same History
-				// limit the live message path uses: without it message_history grows
-				// forever, and every row carries a full serialized event in datajson.
-				var historyLimit int
-				userinfo, found := userinfocache.Get(mycli.token)
-				if found {
-					historyStr := userinfo.(Values).Get("History")
-					historyLimit, _ = strconv.Atoi(historyStr)
-				} else {
-					log.Warn().Str("userID", mycli.userID).Msg("User info not found in cache, skipping HistorySync history")
-					return
-				}
-				if historyLimit <= 0 {
-					return
-				}
-
 				// Get the account owner's JID for messages sent by the instance
 				accountOwnerJID := ""
 				if mycli.WAClient.Store != nil && mycli.WAClient.Store.ID != nil {
@@ -1465,7 +1448,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						continue
 					}
 
-					convSaved := 0
 					for _, msg := range conv.Messages {
 						if msg == nil || msg.Message == nil {
 							continue
@@ -1695,20 +1677,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 									Msg("Failed to save HistorySync message to history")
 							} else {
 								savedCount++
-								convSaved++
 							}
-						}
-					}
-
-					// Trim once per conversation rather than per message: a batch can
-					// carry thousands of messages for a single chat, and trimming inside
-					// the loop would issue a DELETE for every row saved.
-					if convSaved > 0 {
-						if err := mycli.s.trimMessageHistory(mycli.userID, chatJID.String(), historyLimit); err != nil {
-							log.Error().Err(err).
-								Str("userID", mycli.userID).
-								Str("chatJID", chatJID.String()).
-								Msg("Failed to trim message history after HistorySync")
 						}
 					}
 				}

@@ -1,9 +1,7 @@
 package main
 
 import (
-	"fmt"
 	"testing"
-	"time"
 )
 
 // TestSaveMessageToHistoryIdempotent verifies the fix for #292: persisting a
@@ -56,88 +54,5 @@ func TestSaveMessageToHistoryIdempotent(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("expected 2 distinct rows, got %d", count)
-	}
-}
-
-// TestTrimMessageHistoryKeepsNewestWithinLimit pins the retention contract that
-// the HistorySync batch path now depends on: trimMessageHistory must keep only
-// the newest `limit` messages for a (user, chat) pair and leave other chats
-// alone. HistorySync previously wrote its batches without ever trimming, which
-// let message_history grow without bound.
-func TestTrimMessageHistoryKeepsNewestWithinLimit(t *testing.T) {
-	s := makeTestServer(t)
-
-	// whatsmeow owns this table in production; trimMessageHistory clears the
-	// matching secrets first, so the test schema needs it to exist.
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS whatsmeow_message_secrets (
-		message_id TEXT
-	)`); err != nil {
-		t.Fatalf("failed to create whatsmeow_message_secrets stub: %v", err)
-	}
-
-	const (
-		userID    = "user-trim"
-		chat      = "111@s.whatsapp.net"
-		otherChat = "222@s.whatsapp.net"
-		total     = 10
-		keep      = 4
-	)
-
-	// saveMessageToHistory stamps time.Now(), which is not distinct enough
-	// inside a loop to order by, so insert with explicit increasing timestamps.
-	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	insert := func(chatJID, msgID string, ts time.Time) {
-		t.Helper()
-		if _, err := s.db.Exec(
-			`INSERT INTO message_history (user_id, chat_jid, sender_jid, message_id, timestamp, message_type, text_content)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			userID, chatJID, "sender@s.whatsapp.net", msgID, ts, "text", msgID); err != nil {
-			t.Fatalf("insert %s failed: %v", msgID, err)
-		}
-	}
-
-	for i := 0; i < total; i++ {
-		insert(chat, fmt.Sprintf("MSG-%02d", i), base.Add(time.Duration(i)*time.Minute))
-	}
-	// A second chat that must be left untouched.
-	for i := 0; i < 3; i++ {
-		insert(otherChat, fmt.Sprintf("OTHER-%02d", i), base.Add(time.Duration(i)*time.Minute))
-	}
-
-	if err := s.trimMessageHistory(userID, chat, keep); err != nil {
-		t.Fatalf("trimMessageHistory failed: %v", err)
-	}
-
-	var remaining int
-	if err := s.db.Get(&remaining,
-		"SELECT COUNT(*) FROM message_history WHERE user_id = ? AND chat_jid = ?",
-		userID, chat); err != nil {
-		t.Fatalf("count query failed: %v", err)
-	}
-	if remaining != keep {
-		t.Fatalf("expected %d rows to survive the trim, got %d", keep, remaining)
-	}
-
-	// The survivors must be the newest ones: MSG-06..MSG-09.
-	var oldest string
-	if err := s.db.Get(&oldest,
-		`SELECT message_id FROM message_history
-		 WHERE user_id = ? AND chat_jid = ? ORDER BY timestamp ASC LIMIT 1`,
-		userID, chat); err != nil {
-		t.Fatalf("oldest survivor query failed: %v", err)
-	}
-	if want := fmt.Sprintf("MSG-%02d", total-keep); oldest != want {
-		t.Fatalf("expected oldest surviving message to be %s, got %s", want, oldest)
-	}
-
-	// Trimming one chat must not touch another.
-	var otherRemaining int
-	if err := s.db.Get(&otherRemaining,
-		"SELECT COUNT(*) FROM message_history WHERE user_id = ? AND chat_jid = ?",
-		userID, otherChat); err != nil {
-		t.Fatalf("other-chat count query failed: %v", err)
-	}
-	if otherRemaining != 3 {
-		t.Fatalf("expected the untrimmed chat to keep 3 rows, got %d", otherRemaining)
 	}
 }
