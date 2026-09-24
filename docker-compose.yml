@@ -18,13 +18,12 @@ services:
       - TZ=${TZ:-America/Sao_Paulo}
       - WEBHOOK_FORMAT=${WEBHOOK_FORMAT:-json}
       - SESSION_DEVICE_NAME=${SESSION_DEVICE_NAME:-WuzAPI}
-      # RabbitMQ configuration Optional
-      - RABBITMQ_URL=amqp://wuzapi:wuzapi@rabbitmq:5672/
-      - RABBITMQ_QUEUE=whatsapp_events
+      # RabbitMQ publishing is disabled: nothing consumed the queues.
+      # To re-enable, set RABBITMQ_URL (and optionally RABBITMQ_QUEUE) here and
+      # restore the rabbitmq service below. See InitRabbitMQ() in rabbitmq.go -
+      # an unset RABBITMQ_URL disables publishing without erroring.
     depends_on:
       db:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
     networks:
       - wuzapi-network
@@ -45,28 +44,7 @@ services:
       - wuzapi-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-wuzapi}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: always
-
-  rabbitmq:
-    image: rabbitmq:3-management
-    hostname: rabbitmq
-    environment:
-      RABBITMQ_DEFAULT_USER: wuzapi
-      RABBITMQ_DEFAULT_PASS: wuzapi
-      RABBITMQ_DEFAULT_VHOST: /
-    ports:
-      - "5672:5672" # AMQP port
-      - "15672:15672" # Management UI port
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    networks:
-      - wuzapi-network
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 5
     restart: always
@@ -79,4 +57,3 @@ networks:
 
 volumes:
   db_data:
-  rabbitmq_data:
